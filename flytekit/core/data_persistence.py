@@ -71,6 +71,10 @@ def s3_setup_args(s3_cfg: configuration.S3Config, anonymous: bool = False) -> Di
     if s3_cfg.endpoint is not None:
         kwargs["client_kwargs"] = {"endpoint_url": s3_cfg.endpoint}
 
+    # Add signature version configuration
+    if s3_cfg.signature_version is not None:
+        kwargs["config_kwargs"] = {"signature_version": s3_cfg.signature_version}
+
     if anonymous:
         kwargs[_ANON] = True
 
