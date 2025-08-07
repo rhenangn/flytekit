@@ -58,6 +58,8 @@ _WRITE_SIZE_CHUNK_BYTES = int(os.environ.get("_F_P_WRITE_CHUNK_SIZE", "26214400"
 
 
 def s3_setup_args(s3_cfg: configuration.S3Config, anonymous: bool = False) -> Dict[str, Any]:
+    logger.debug(f"Setting up S3 args with config: endpoint={s3_cfg.endpoint}, signature_version={s3_cfg.signature_version}, anonymous={anonymous}")
+
     kwargs: Dict[str, Any] = {
         "cache_regions": True,
     }
@@ -78,6 +80,7 @@ def s3_setup_args(s3_cfg: configuration.S3Config, anonymous: bool = False) -> Di
     if anonymous:
         kwargs[_ANON] = True
 
+    logger.debug(f"S3 setup args result: {kwargs}")
     return kwargs
 
 
@@ -228,6 +231,7 @@ class FileAccessProvider(object):
         elif protocol == "s3":
             s3kwargs = s3_setup_args(self._data_config.s3, anonymous=anonymous)
             s3kwargs.update(kwargs)
+            logger.debug(f"Creating S3 filesystem with kwargs: {s3kwargs}")
             return fsspec.filesystem(protocol, **s3kwargs)  # type: ignore
         elif protocol == "gs":
             if anonymous:
