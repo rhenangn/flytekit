@@ -54,7 +54,7 @@ ENVIRONMENT VARIABLES:
 S3_ENDPOINT = os.environ.get('S3_ENDPOINT', 'http://localhost:9000')
 S3_ACCESS_KEY_ID = os.environ.get('S3_ACCESS_KEY_ID', 'minioadmin')
 S3_SECRET_ACCESS_KEY = os.environ.get('S3_SECRET_ACCESS_KEY', 'minioadmin')
-S3_SIGNATURE_VERSION = os.environ.get('S3_SIGNATURE_VERSION', 's3')  # 's3', 's3v4', or 's3v2'
+S3_SIGNATURE_VERSION = os.environ.get('S3_SIGNATURE_VERSION')  # 's3', 's3v4', or 's3v2'
 
 # Test Bucket and Paths
 TEST_BUCKET = os.environ.get('TEST_BUCKET', 's3://test-bucket')
@@ -78,6 +78,47 @@ formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(messag
 handler.setFormatter(formatter)
 logger.addHandler(handler)
 
+def enable_aws_debug_logging():
+    """
+    Enable verbose debug logging for AWS/BotoCore/S3FS/urllib3 to diagnose S3 issues
+    like SignatureDoesNotMatch. WARNING: This can log sensitive headers.
+    """
+    # Attach handler to root so all libraries emit to console
+    root_logger = logging.getLogger()
+    if not any(isinstance(h, logging.StreamHandler) for h in root_logger.handlers):
+        root_logger.addHandler(handler)
+    root_logger.setLevel(LOG_LEVEL)
+
+    # Verbose categories
+    aws_loggers = [
+        'botocore',
+        'botocore.auth',
+        'botocore.credentials',
+        'botocore.endpoint',
+        'botocore.parsers',
+        'botocore.hooks',
+        'botocore.utils',
+        'aiobotocore',
+        's3fs',
+        'fsspec',
+        'urllib3',
+        'urllib3.connectionpool',
+        'aiohttp.client',
+    ]
+    for name in aws_loggers:
+        lg = logging.getLogger(name)
+        lg.setLevel(logging.DEBUG)
+        lg.propagate = True
+
+    # Optional: wire-level HTTP logs (very noisy; may include auth headers)
+    try:
+        import http.client as http_client  # type: ignore
+        http_client.HTTPConnection.debuglevel = 1
+        logging.getLogger('http.client').setLevel(logging.DEBUG)
+        logging.getLogger('http.client').propagate = True
+    except Exception:
+        pass
+
 def test_s3_signature_error():
     """
     Test to reproduce and diagnose the SignatureDoesNotMatch error
@@ -86,6 +127,9 @@ def test_s3_signature_error():
     print("FLYTEKIT S3 SIGNATURE ERROR DIAGNOSTIC TEST")
     print("=" * 80)
     print(f"Test started at: {datetime.now()}")
+
+    print("\n🪵 Enabling AWS SDK debug logging (this can be very verbose)...")
+    enable_aws_debug_logging()
 
     # Display current configuration
     print(f"\n📋 CONFIGURATION PARAMETERS:")
@@ -109,13 +153,15 @@ def test_s3_signature_error():
         print(f"✗ SSL certificate bundle not found - SSL errors may occur")
         print(f"  Expected location: {AWS_CA_BUNDLE}")
 
-    # Create S3 configuration using parameters
-    s3_config = S3Config(
-        signature_version=S3_SIGNATURE_VERSION,
+    # Create S3 configuration using parameters; omit signature_version if not set in env
+    s3_kwargs = dict(
         endpoint=S3_ENDPOINT,
         access_key_id=S3_ACCESS_KEY_ID,
-        secret_access_key=S3_SECRET_ACCESS_KEY
+        secret_access_key=S3_SECRET_ACCESS_KEY,
     )
+    if S3_SIGNATURE_VERSION:
+        s3_kwargs["signature_version"] = S3_SIGNATURE_VERSION
+    s3_config = S3Config(**s3_kwargs)
     data_config = DataConfig(s3=s3_config)
 
     print(f"\n🔧 S3 CONFIGURATION:")
@@ -187,9 +233,6 @@ def test_s3_signature_error():
                 print(f"✗ FlyteUploadDataException caught:")
                 print(f"  Error: {e}")
                 print(f"  Original exception: {e.__cause__}")
-                if "SignatureDoesNotMatch" in str(e):
-                    print("  >>> This is the SignatureDoesNotMatch error we're investigating!")
-                    analyze_signature_error(e, s3_config)
 
             except FlyteDownloadDataException as e:
                 print(f"✗ FlyteDownloadDataException caught:")
@@ -200,40 +243,6 @@ def test_s3_signature_error():
                 print(f"✗ Unexpected error: {type(e).__name__}: {e}")
                 traceback.print_exc()
 
-            # Test 4: Try different signature versions
-            print("\n" + "-" * 60)
-            print("TEST 4: Testing different signature versions")
-            print("-" * 60)
-
-            for sig_ver in SIGNATURE_VERSIONS_TO_TEST:
-                try:
-                    print(f"\nTrying signature version: {sig_ver}")
-                    test_config = S3Config(
-                        signature_version=sig_ver,
-                        endpoint=S3_ENDPOINT,
-                        access_key_id=S3_ACCESS_KEY_ID,
-                        secret_access_key=S3_SECRET_ACCESS_KEY
-                    )
-                    test_data_config = DataConfig(s3=test_config)
-                    test_provider = FileAccessProvider(
-                        local_sandbox_dir=tmp_dir,
-                        raw_output_prefix=f'{test_bucket}/raw/',
-                        data_config=test_data_config
-                    )
-
-                    test_fs = test_provider.get_filesystem_for_path(test_path)
-                    print(f"  ✓ Filesystem created with {sig_ver}")
-
-                    # Try a simple operation
-                    test_remote_path = f'{test_path}/sig_test_{sig_ver}.txt'
-                    test_provider.put_data(test_file, test_remote_path)
-                    print(f"  ✓ Successfully uploaded with signature version {sig_ver}")
-
-                except Exception as e:
-                    print(f"  ✗ Failed with {sig_ver}: {type(e).__name__}: {e}")
-                    if "SignatureDoesNotMatch" in str(e):
-                        print(f"    >>> SignatureDoesNotMatch error with {sig_ver}")
-
         except Exception as e:
             print(f"\n✗ CRITICAL ERROR: {type(e).__name__}: {e}")
             traceback.print_exc()
@@ -241,39 +250,6 @@ def test_s3_signature_error():
     print("\n" + "=" * 80)
     print("TEST COMPLETED")
     print("=" * 80)
-
-def analyze_signature_error(error, s3_config):
-    """
-    Analyze the SignatureDoesNotMatch error and provide diagnostic information
-    """
-    print("\n" + "!" * 60)
-    print("SIGNATURE ERROR ANALYSIS")
-    print("!" * 60)
-
-    print("Common causes of SignatureDoesNotMatch errors:")
-    print("1. Incorrect AWS Access Key ID or Secret Access Key")
-    print("2. Wrong signature version (s3, s3v4, s3v2)")
-    print("3. Clock skew between client and server")
-    print("4. Incorrect endpoint URL")
-    print("5. Special characters in credentials not properly encoded")
-    print("6. Region mismatch (for AWS S3)")
-    print("7. MinIO-specific authentication issues")
-
-    print(f"\nCurrent configuration analysis:")
-    print(f"  Endpoint: {s3_config.endpoint}")
-    print(f"  - Using HTTPS: {'✓' if s3_config.endpoint.startswith('https') else '✗'}")
-    print(f"  - Custom endpoint (MinIO): ✓")
-    print(f"  Signature Version: {s3_config.signature_version}")
-    print(f"  - Recommended for MinIO: s3v4")
-    print(f"  Access Key Length: {len(s3_config.access_key_id)} characters")
-    print(f"  Secret Key Length: {len(s3_config.secret_access_key)} characters")
-
-    print(f"\nRecommended fixes to try:")
-    print(f"1. Change signature_version from '{s3_config.signature_version}' to 's3v4'")
-    print(f"2. Verify credentials are correct for MinIO server")
-    print(f"3. Check if MinIO server requires specific authentication settings")
-    print(f"4. Ensure system clock is synchronized")
-    print(f"5. Try without TLS (http://) if certificate issues exist")
 
 if __name__ == "__main__":
     test_s3_signature_error()

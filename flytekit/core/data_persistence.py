@@ -73,9 +73,17 @@ def s3_setup_args(s3_cfg: configuration.S3Config, anonymous: bool = False) -> Di
     if s3_cfg.endpoint is not None:
         kwargs["client_kwargs"] = {"endpoint_url": s3_cfg.endpoint}
 
-    # Add signature version configuration
+    # botocore Config kwargs
+    config_kwargs: Dict[str, Any] = {}
+    # Ensure request checksums are only used when strictly required to avoid
+    # aws-chunked transfer encoding which removes Content-Length and breaks some S3-compatible stores
+    config_kwargs["request_checksum_calculation"] = "when_required"
+    # Prefer path-style for S3-compatible endpoints
+    config_kwargs["s3"] = {"addressing_style": "path"}
     if s3_cfg.signature_version is not None:
-        kwargs["config_kwargs"] = {"signature_version": s3_cfg.signature_version}
+        config_kwargs["signature_version"] = s3_cfg.signature_version
+    if config_kwargs:
+        kwargs["config_kwargs"] = config_kwargs
 
     if anonymous:
         kwargs[_ANON] = True
@@ -390,8 +398,44 @@ class FileAccessProvider(object):
         additional_kwargs = get_additional_fsspec_call_kwargs(file_system.protocol, file_system.put.__name__)
         kwargs.update(additional_kwargs)
 
+        # For small single-file uploads to S3, ensure ContentLength is provided to avoid
+        # servers that reject aws-chunked streaming (e.g., some MinIO/proxy setups).
+        try:
+            is_single_file = not recursive and os.path.isfile(from_path)
+        except Exception:
+            is_single_file = False
+
+        protocol_name_for_headers = (
+            file_system.protocol[0] if isinstance(file_system.protocol, (tuple, list)) else file_system.protocol
+        )
+        if protocol_name_for_headers == "s3" and is_single_file and "ContentLength" not in kwargs:
+            try:
+                file_size_bytes = os.path.getsize(from_path)
+                kwargs["ContentLength"] = int(file_size_bytes)
+                logger.debug(f"Set S3 ContentLength={file_size_bytes} for upload of {from_path}")
+            except Exception as e:
+                logger.debug(f"Could not determine file size for ContentLength: {e}")
+
         if isinstance(file_system, AsyncFileSystem):
-            dst = await file_system._put(from_path, to_path, recursive=recursive, **kwargs)  # pylint: disable=W0212
+            # Some S3 backends (e.g., MinIO with certain configs) require an explicit
+            # Content-Length header on PutObject. The async client path in s3fs/aiobotocore
+            # can, in some cases, omit this header leading to MissingContentLength errors.
+            # Fallback to the synchronous client for S3 uploads to ensure Content-Length is set.
+            protocol_name = (
+                file_system.protocol[0]
+                if isinstance(file_system.protocol, (tuple, list))
+                else file_system.protocol
+            )
+            if protocol_name == "s3":
+                logger.debug(
+                    "Using synchronous S3 put to ensure Content-Length header is provided"
+                )
+                sync_fs = self.get_filesystem(protocol_name, anonymous=False, path=to_path)
+                dst = sync_fs.put(from_path, to_path, recursive=recursive, **kwargs)
+            else:
+                dst = await file_system._put(  # pylint: disable=W0212
+                    from_path, to_path, recursive=recursive, **kwargs
+                )
         else:
             dst = file_system.put(from_path, to_path, recursive=recursive, **kwargs)
         if isinstance(dst, (str, pathlib.Path)):
