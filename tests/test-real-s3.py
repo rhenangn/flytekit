@@ -12,6 +12,7 @@ from flytekit.loggers import logger
 from flytekit.configuration import S3Config, DataConfig
 from flytekit.core.data_persistence import FileAccessProvider
 from flytekit.exceptions.system import FlyteUploadDataException, FlyteDownloadDataException
+from flytekit.utils.asyn import loop_manager
 
 # ============================================================================
 # TEST CONFIGURATION PARAMETERS
@@ -64,7 +65,6 @@ TEST_PATH_PREFIX = os.environ.get('TEST_PATH_PREFIX', 'test-signature-error')
 AWS_CA_BUNDLE = os.environ.get('AWS_CA_BUNDLE', '/path/to/ca-bundle.crt')
 
 # Test Configuration
-SIGNATURE_VERSIONS_TO_TEST = ['s3', 's3v4', 's3v2']  # All versions to test in diagnostic mode
 LOG_LEVEL = logging.DEBUG
 
 # ============================================================================
@@ -203,19 +203,65 @@ def test_s3_signature_error():
             print("TEST 3: Testing S3 operations that trigger signature errors")
             print("-" * 60)
 
-            # Create a test file locally
+            # Create a test file with unique, verifiable content
             test_file = os.path.join(tmp_dir, 'test_file.txt')
+            import uuid
+            import hashlib
+
+            # Generate unique test content
+            test_uuid = str(uuid.uuid4())
+            test_timestamp = datetime.now().isoformat()
+            test_content = f"""FLYTEKIT S3 SIGNATURE TEST FILE
+=================================
+Test UUID: {test_uuid}
+Created at: {test_timestamp}
+S3 Endpoint: {S3_ENDPOINT}
+S3 Signature Version: {S3_SIGNATURE_VERSION}
+Test Bucket: {TEST_BUCKET}
+Test Path Prefix: {TEST_PATH_PREFIX}
+
+This file contains unique content to verify upload/download integrity.
+If you can read this exact content after download, the S3 operations worked correctly!
+
+Random data for uniqueness:
+- Random number: {hash(test_uuid) % 1000000}
+- Content length marker: [CONTENT_LENGTH_WILL_BE_INSERTED_HERE]
+=================================
+END OF TEST FILE"""
+
+            # Calculate content length and insert it
+            content_length = len(test_content.encode('utf-8'))
+            test_content = test_content.replace('[CONTENT_LENGTH_WILL_BE_INSERTED_HERE]', f'{content_length} bytes')
+
+            # Write the content and calculate hash for verification
             with open(test_file, 'w') as f:
-                f.write("This is a test file for S3 signature error reproduction\n")
-                f.write(f"Created at: {datetime.now()}\n")
+                f.write(test_content)
+
+            # Calculate SHA256 hash for integrity verification
+            with open(test_file, 'rb') as f:
+                file_hash = hashlib.sha256(f.read()).hexdigest()
 
             print(f"Created local test file: {test_file}")
+            print(f"  File size: {len(test_content.encode('utf-8'))} bytes")
+            print(f"  SHA256 hash: {file_hash}")
+            print(f"  Test UUID: {test_uuid}")
 
-            # Test 3a: Try to put data (this often triggers SignatureDoesNotMatch)
+            # Store these for later verification
+            original_content = test_content
+            original_hash = file_hash
+            original_uuid = test_uuid
+
+            # Test 3: Try original put operation
+            print("\n" + "-" * 60)
+            print("TEST 3: Testing Flytekit put operation")
+            print("-" * 60)
+
             try:
-                print("\nTesting put_data operation...")
+                print("\nTesting put operation...")
                 remote_path = f'{test_path}/put_test.txt'
-                provider.put_data(test_file, remote_path)
+                # Create a synchronous wrapper for the async _put method
+                put_sync = loop_manager.synced(provider._put)
+                put_sync(test_file, remote_path, recursive=False)
                 print(f"✓ Successfully uploaded file to: {remote_path}")
 
                 # Test 3b: Try to get data back
@@ -224,10 +270,46 @@ def test_s3_signature_error():
                 provider.get_data(remote_path, download_file)
                 print(f"✓ Successfully downloaded file to: {download_file}")
 
-                # Verify content
+                # Comprehensive content verification
+                print("\n🔍 CONTENT VERIFICATION:")
                 with open(download_file, 'r') as f:
-                    content = f.read()
-                    print(f"Downloaded content preview: {content[:100]}...")
+                    downloaded_content = f.read()
+
+                # Calculate hash of downloaded content
+                with open(download_file, 'rb') as f:
+                    downloaded_hash = hashlib.sha256(f.read()).hexdigest()
+
+                # Verify content integrity
+                content_match = downloaded_content == original_content
+                hash_match = downloaded_hash == original_hash
+
+                print(f"  Original file size: {len(original_content.encode('utf-8'))} bytes")
+                print(f"  Downloaded file size: {len(downloaded_content.encode('utf-8'))} bytes")
+                print(f"  Original SHA256: {original_hash}")
+                print(f"  Downloaded SHA256: {downloaded_hash}")
+                print(f"  Content match: {'✓ YES' if content_match else '✗ NO'}")
+                print(f"  Hash match: {'✓ YES' if hash_match else '✗ NO'}")
+
+                if content_match and hash_match:
+                    print("  🎉 PERFECT MATCH! Upload/download integrity verified!")
+
+                    # Extract and verify the UUID from downloaded content
+                    import re
+                    uuid_match = re.search(r'Test UUID: ([a-f0-9-]+)', downloaded_content)
+                    if uuid_match and uuid_match.group(1) == original_uuid:
+                        print(f"  ✓ UUID verification passed: {original_uuid}")
+                    else:
+                        print(f"  ✗ UUID verification failed!")
+                else:
+                    print("  ❌ CONTENT MISMATCH! There may be data corruption or encoding issues.")
+                    if not content_match:
+                        print("  Content differs between upload and download")
+                    if not hash_match:
+                        print("  Hash differs - possible data corruption")
+
+                # Show a preview of the downloaded content
+                print(f"\n📄 Downloaded content preview (first 200 chars):")
+                print(f"  {downloaded_content[:200]}{'...' if len(downloaded_content) > 200 else ''}")
 
             except FlyteUploadDataException as e:
                 print(f"✗ FlyteUploadDataException caught:")
